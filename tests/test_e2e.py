@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import os
 import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -118,6 +119,23 @@ def set_behavior(origin_url: str, delay_ms: int = 0, truncate: int | None = None
             },
         )
         r.raise_for_status()
+
+
+def abort_before_body(base: str, path: str) -> None:
+    """Send a full GET then RST the socket without reading any response bytes.
+
+    The proxy endpoint has already attached its reader by the time the RST
+    arrives; the disconnect may be processed before the body iterator starts.
+    """
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(5)
+    host, port = base.removeprefix("http://").split(":")
+    s.connect((host, int(port)))
+    s.sendall(
+        f"GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n".encode()
+    )
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+    s.close()
 
 
 @pytest.fixture(scope="session")
@@ -400,3 +418,137 @@ def test_path_traversal_rejected(proxy):
     with client() as c:
         r = c.get(f"{proxy.url}/packages/..%2f..%2fetc%2fpasswd")
     assert r.status_code in (400, 404)
+
+
+def test_early_disconnect_releases_reader_and_purge_reclaims(proxy, origin):
+    """Regression: client gone after attach but before the body generator
+    starts must not leave a reader that pins the package past a purge."""
+    origin_reset(origin.url)
+    body1 = download_bytes(proxy.url, PKG_SMALL)
+
+    # Many aborted requests, in bursts, cover the window where the ASGI task is
+    # cancelled before the streaming generator is first entered.
+    for _ in range(8):
+        for _ in range(64):
+            abort_before_body(proxy.url, f"/packages/{PKG_SMALL}")
+        time.sleep(0.2)
+
+    with client() as c:
+        status = c.get(f"{proxy.url}/cache/status").json()
+    assert PKG_SMALL in status, "completed entry must stay registered"
+    assert status[PKG_SMALL]["readers"] == 0, (
+        f"aborted requests leaked readers: {status[PKG_SMALL]['readers']}"
+    )
+
+    with client() as c:
+        pr = c.post(f"{proxy.url}/purge/{PKG_SMALL}")
+    assert pr.status_code == 200 and pr.json()["was_cached"] is True
+    time.sleep(0.3)
+
+    leftovers = list(proxy.cache_dir.glob(f"{PKG_SMALL}*"))
+    assert leftovers == [], f"purge left files behind: {leftovers}"
+
+    # Next download must re-fetch from origin, not hit stale disk bytes.
+    with client() as c:
+        new = c.post(f"{origin.url}/control/content/{PKG_SMALL}").json()
+        r = c.get(f"{proxy.url}/packages/{PKG_SMALL}")
+    assert r.headers["x-cache"] == "MISS"
+    assert sha256(r.content) == new["sha256"]
+    assert r.content != body1
+    assert origin_stats(origin.url)["paths"][PKG_SMALL] == 2
+
+
+def test_repeated_aborts_never_drive_reader_count_negative(proxy, origin):
+    """Repeated disconnects/cancels release only their own lease."""
+    origin_reset(origin.url)
+    download_bytes(proxy.url, PKG_SMALL)
+
+    for _ in range(5):
+        for _ in range(48):
+            abort_before_body(proxy.url, f"/packages/{PKG_SMALL}")
+        time.sleep(0.15)
+
+    with client() as c:
+        status = c.get(f"{proxy.url}/cache/status").json()
+    assert status[PKG_SMALL]["readers"] == 0
+
+    # A well-behaved download still works end to end afterwards.
+    body = download_bytes(proxy.url, PKG_SMALL)
+    assert sha256(body) == origin_stats(origin.url)["packages"][PKG_SMALL]["sha256"]
+
+
+def stalled_reader_socket(base: str, path: str, body_before_stall: int) -> socket.socket:
+    """GET that reads some body bytes then stops, applying TCP backpressure.
+
+    The receive buffer is pinned to the minimum; once *body_before_stall*
+    bytes have arrived the caller stops reading, so the proxy's next send
+    blocks and this reader's lease stays held until the socket is closed.
+    The 32MiB package (far larger than any socket buffer) is required for the
+    server side to actually block.
+    """
+    host, port = base.removeprefix("http://").split(":")
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+    s.settimeout(30)
+    s.connect((host, int(port)))
+    s.sendall(
+        f"GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n".encode()
+    )
+    data = b""
+    while data.find(b"\r\n\r\n") < 0:
+        data += s.recv(64 * 1024)
+    header_end = data.find(b"\r\n\r\n")
+    body = len(data) - header_end - 4
+    while body < body_before_stall:
+        chunk = s.recv(64 * 1024)
+        if not chunk:
+            break
+        body += len(chunk)
+    assert body >= body_before_stall
+    return s
+
+
+def test_purge_then_refill_blocked_old_reader_keeps_new_generation(proxy, origin):
+    """A held lease on a purged generation must not let its late reap unlink
+    the new generation's file at the same path (inode-guarded reap)."""
+    origin_reset(origin.url)
+    # ~2.6s fills; the fill writes disk independently, so it completes even
+    # while this reader's send is blocked and the lease stays attached.
+    set_behavior(origin.url, delay_ms=20, chunk_size=256 * 1024)
+    stalled = None
+    try:
+        stalled = stalled_reader_socket(
+            proxy.url, f"/packages/{PKG_BIG}", 256 * 1024
+        )
+
+        with client() as c:
+            pr = c.post(f"{proxy.url}/purge/{PKG_BIG}")
+        assert pr.json()["was_cached"] is True
+        # Generation 2: fresh fill publishes a new inode at the same path while
+        # generation 1's blocked reader still holds its lease.
+        body2 = download_bytes(proxy.url, PKG_BIG)
+        assert len(body2) == 32 * MIB
+        assert origin_stats(origin.url)["paths"][PKG_BIG] == 2
+        assert (proxy.cache_dir / PKG_BIG).is_file()
+
+        # Closing the stalled connection releases the old generation's lease and
+        # triggers its reap; give it time to settle.
+        stalled.close()
+        stalled = None
+        time.sleep(1.0)
+
+        # The new generation's files must have survived the old reap.
+        assert (proxy.cache_dir / PKG_BIG).is_file(), "new generation file was deleted"
+        assert (proxy.cache_dir / f"{PKG_BIG}.meta").is_file(), "new meta was deleted"
+        with client() as c:
+            r = c.get(f"{proxy.url}/packages/{PKG_BIG}")
+        assert r.status_code == 200
+        assert r.headers["x-cache"] == "HIT", "new generation was wrongly reaped"
+        assert r.content == body2
+    finally:
+        if stalled is not None:
+            stalled.close()
+        set_behavior(origin.url)
+        with client() as c:
+            c.post(f"{proxy.url}/purge/{PKG_BIG}")
+

@@ -10,9 +10,16 @@ Design notes
 * Slow clients never block the fill or other clients: the fill only writes to
   disk; every reader tails the file at its own pace. Per-client memory is one
   read buffer, independent of package size.
+* Every download holds a one-shot :class:`Lease` on its generation. The ASGI
+  response releases the lease in a ``finally`` even when the client
+  disconnects before the body iterator starts (whose generator-level
+  ``finally`` would otherwise never run), so a torn-down request never pins a
+  cached package or its files.
 * Purge unregisters the current generation. In-flight fills keep feeding
   their existing readers but are never re-registered; old files are unlinked
-  once the last reader detaches.
+  once the last reader detaches. Reaps compare on-disk file identity
+  (generation metadata + inode) before unlinking, so a late release of an old
+  generation can never remove a newer generation's file at the same path.
 * Origin failure fails every attached download and never leaves a cached
   half-package. Startup deletes leftover ``.part-*`` files and keeps complete
   packages.
@@ -64,6 +71,51 @@ class FillFailed(Exception):
     """Raised inside a client stream when the origin fill failed."""
 
 
+def _file_id(path: Path) -> tuple[int, int] | None:
+    """``(device, inode)`` identity of *path*, or ``None`` if it is absent."""
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    return (st.st_dev, st.st_ino)
+
+
+def _unlink_if_id(path: Path, identity: tuple[int, int] | None) -> None:
+    """Unlink *path* only while it still holds *identity*.
+
+    A purged generation must never delete a newer generation's file that was
+    published at the same path: if the path now points at a different inode
+    (or identity was never recorded), leave it alone.
+    """
+    if identity is None:
+        return
+    if _file_id(path) != identity:
+        return
+    _unlink_quiet(path)
+
+
+class Lease:
+    """A single reader's claim on one :class:`Entry` generation.
+
+    Release is one-shot and lives behind the ASGI response's ``finally``, so
+    disconnects and cancellations decrement exactly once: a request that is
+    torn down before the body generator starts (and whose generator-level
+    cleanup therefore never runs) still releases its own lease, and repeated
+    cancels cannot touch another reader's lease.
+    """
+
+    def __init__(self, cache: "Cache", entry: "Entry") -> None:
+        self._cache = cache
+        self.entry = entry
+        self.released = False
+
+    async def release(self) -> None:
+        if self.released:
+            return
+        self.released = True
+        await self._cache._release_lease(self)
+
+
 class Entry:
     """One generation of a cached object.
 
@@ -87,6 +139,11 @@ class Entry:
         self.meta: dict = {}
         self.cond = asyncio.Condition()
         self.fill_task: asyncio.Task | None = None
+        # On-disk identity for the fixed-name published files; reaps unlink
+        # them only while the path still points at this generation's inode.
+        # Part files need no guard: their name embeds the generation UUID.
+        self.final_id: tuple[int, int] | None = None
+        self.meta_id: tuple[int, int] | None = None
 
     @property
     def final_path(self) -> Path:
@@ -141,11 +198,13 @@ class Cache:
         except (OSError, ValueError):
             e.meta = {}
         e.meta.setdefault("content_type", "application/octet-stream")
+        e.final_id = _file_id(final)
+        e.meta_id = _file_id(e.meta_path)
         self.entries[key] = e
         return e
 
-    async def attach(self, key: str) -> Entry:
-        """Return the current generation for key, starting a fill if needed."""
+    async def attach(self, key: str) -> Lease:
+        """Return a lease on the current generation, starting a fill if needed."""
         async with self.lock:
             e = self.entries.get(key)
             if e is None:
@@ -155,10 +214,14 @@ class Cache:
                 self.entries[key] = e
                 e.fill_task = asyncio.create_task(self._fill(e))
             e.readers += 1
-            return e
+            return Lease(self, e)
 
-    async def detach(self, e: Entry) -> None:
+    async def _release_lease(self, lease: Lease) -> None:
+        """Return one reader; reap the generation's files when it was the last."""
+        e = lease.entry
         async with self.lock:
+            if e.readers <= 0:  # defensive: leases are one-shot, this must not happen
+                return
             e.readers -= 1
             self._maybe_reap_locked(e)
 
@@ -186,15 +249,19 @@ class Cache:
             return existed
 
     def _maybe_reap_locked(self, e: Entry) -> None:
-        """Delete files once no readers remain and the fill is over."""
+        """Delete files once no readers remain and the fill is over.
+
+        Unlinks go through identity checks: an old generation must never
+        remove a newer generation's file that now occupies the same path.
+        """
         if e.readers > 0 or e.state == "filling":
             return
         if e.state == "failed":
-            _unlink_quiet(e.part_path)  # never keep a half package
+            _unlink_quiet(e.part_path)  # generation-unique name; never keep half
         elif e.purged:  # complete or closed
             _unlink_quiet(e.part_path)
-            _unlink_quiet(e.final_path)
-            _unlink_quiet(e.meta_path)
+            _unlink_if_id(e.final_path, e.final_id)
+            _unlink_if_id(e.meta_path, e.meta_id)
 
     # ------------------------------------------------------------------ #
     # origin fill                                                         #
@@ -248,10 +315,12 @@ class Cache:
                     e.state = "closed"
                 else:
                     os.replace(e.part_path, e.final_path)  # atomic publish
+                    e.final_id = _file_id(e.final_path)
                     try:
                         e.meta_path.write_text(json.dumps(e.meta))
                     except OSError:
                         pass
+                    e.meta_id = _file_id(e.meta_path)
                     e.state = "complete"
                 async with e.cond:
                     e.cond.notify_all()
@@ -282,8 +351,9 @@ class Cache:
         except FileNotFoundError:
             return open(e.final_path, "rb")
 
-    async def stream(self, e: Entry):
+    async def stream(self, lease: Lease):
         """Yield the package from byte 0, tailing the fill file if needed."""
+        e = lease.entry
         offset = 0
         f = await asyncio.to_thread(self._open_current, e)
         try:
@@ -311,7 +381,7 @@ class Cache:
             try:
                 f.close()
             finally:
-                await self.detach(e)
+                await lease.release()
 
 
 cache = Cache()
@@ -346,6 +416,27 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="pkg-cache-proxy", version="1.0.0", lifespan=lifespan)
 
 
+class ReleasingStreamingResponse(StreamingResponse):
+    """Streaming response that always releases the reader's lease.
+
+    Starlette/uvicorn (ASGI 2.3) may cancel the response task before the body
+    iterator is ever entered when the client disconnects early; a never-started
+    async generator's ``finally`` does not run, which used to leak the reader.
+    Releasing at the ASGI boundary instead makes cleanup independent of whether
+    streaming began.
+    """
+
+    def __init__(self, lease: Lease, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._lease = lease
+
+    async def __call__(self, scope, receive, send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            await self._lease.release()
+
+
 @app.get("/healthz")
 async def healthz():
     return {"ok": True}
@@ -359,7 +450,8 @@ async def get_package(path: str):
     except ValueError as exc:
         return PlainTextResponse(str(exc), status_code=400)
 
-    entry = await cache.attach(key)
+    lease = await cache.attach(key)
+    entry = lease.entry
     hit = entry.state == "complete"
     try:
         if not entry.headers_known:
@@ -368,11 +460,11 @@ async def get_package(path: str):
                     lambda: entry.headers_known or entry.state == "failed"
                 )
     except asyncio.CancelledError:
-        await cache.detach(entry)
+        await lease.release()  # no response object exists yet to do it for us
         raise
 
     if entry.state == "failed":
-        await cache.detach(entry)
+        await lease.release()
         status = (
             entry.origin_status
             if entry.origin_status and entry.origin_status != 200
@@ -386,8 +478,9 @@ async def get_package(path: str):
     sha256 = entry.meta.get("sha256")
     if sha256:
         headers["X-Package-Sha256"] = sha256
-    return StreamingResponse(
-        cache.stream(entry),
+    return ReleasingStreamingResponse(
+        lease,
+        cache.stream(lease),
         media_type=entry.meta.get("content_type", "application/octet-stream"),
         headers=headers,
     )
