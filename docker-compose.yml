@@ -1,0 +1,27 @@
+name: pkg-cache
+
+services:
+  origin:
+    build: ./origin
+    environment:
+      PKG_DIR: /data/packages
+    volumes:
+      - origin-data:/data/packages
+    ports:
+      - "8081:8000"   # origin control API: /control/*, /docs
+
+  proxy:
+    build: ./proxy
+    environment:
+      ORIGIN_BASE_URL: http://origin:8000
+      CACHE_DIR: /cache
+    volumes:
+      - proxy-cache:/cache   # complete packages survive restarts
+    ports:
+      - "8080:8000"          # download API + /docs purge entry
+    depends_on:
+      - origin
+
+volumes:
+  origin-data:
+  proxy-cache:
